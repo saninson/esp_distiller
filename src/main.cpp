@@ -57,6 +57,8 @@ float dst_percent;
 float heater_R = 16.13;         // heater resistance in Ohms 
 uint16_t pot;                   // potentiometr raw value
 uint32_t last_pot_ms;
+float dst_t2 = 77.0;            // destination column temp for valve control
+uint32_t dst_t2_touch;          // last change time for use in lcd_print
 
 enum OperationMode{
     MODE_MANUAL = 0,            // manual power control 
@@ -108,6 +110,16 @@ void lcd_print_operation_vals(){
     if ((millis() - ms) < RI_LCD)
         return;
 
+    // show dst_t2 for 3 sec if we change it 
+    if (millis() - dst_t2_touch < 3000){
+        lcd.clear();
+        lcd.print("valve temp: ");
+        lcd.print(dst_t2);
+        lcd.print("   ");
+        ms = millis();
+        return;
+    }
+    // else show operation values
     // first line
     lcd.setCursor(0, 0);
     char row[20];
@@ -269,6 +281,15 @@ void program_A2(){
     if(!is_fridge_ok())
         return;
 
+    if(alc_valve.getState() == RL_ON){
+        if(temp.column - dst_t2 > 0.2)
+            alc_valve.off();
+    } else {
+        if(temp.column <= dst_t2 && alc_valve.getState() == RL_OFF)
+            alc_valve.on();
+    }
+    
+
     rm.setVo(dstU);
     ms = millis();
 }
@@ -322,6 +343,18 @@ void initMqtt(){
 }
 #endif
 
+void processEncoder(){
+    if (encoder.getCount()==0)
+        return;
+    dst_t2_touch = millis();
+    dst_t2 += encoder.getCount() / 10.0;
+    encoder.setCount(0);
+    if (dst_t2 < 20.0)
+        dst_t2 = 20.0;
+    else if (dst_t2 > 99.9)
+        dst_t2 = 99.9;
+}
+
 void loop(){
     #ifdef WITH_NETWORK
     ArduinoOTA.handle();
@@ -350,6 +383,7 @@ void loop(){
             break;
     }
     rm.loop();
+    processEncoder();
     lcd_print_operation_vals();
     buzzer.beep();
 }
@@ -373,6 +407,7 @@ void setup(){
 
     encoder.attachSingleEdge(ENC_A_PIN,ENC_B_PIN);
     ESP32Encoder::useInternalWeakPullResistors=NONE;
+    encoder.setCount(0);
 
     enc_btn.begin(ENC_BTN_PIN);
     enc_btn.setLongClickTime(500);
