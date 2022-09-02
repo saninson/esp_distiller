@@ -1,10 +1,4 @@
-#define WITH_OTA
-#ifdef WITH_OTA
-#include <WiFi.h>
-#include <ESPmDNS.h>
-#include <WiFiUdp.h>
-#include <ArduinoOTA.h>
-#endif
+#define WITH_NETWORK
 
 #include <LiquidCrystal_I2C.h>
 #include <Adafruit_MCP3008.h>
@@ -16,28 +10,33 @@
 #include <buzzer.h>
 #include <rm.h>
 #include <Button2.h>
+#include <relay.h>
+#ifdef WITH_NETWORK
+#include "net.h"
+#endif
 
 // MCP3008 channels
-#define ADC_T_COLUMN    0       // temperature in column 
-#define ADC_T_TANK      1       // temperature in tank
-#define ADC_T_FRIDGE    2       // temp of dstPut for stage 1, temp of out water for stage 2
-#define ADC_POT         4       // potentiometr
+#define ADC_T_COLUMN            0       // temperature in column 
+#define ADC_T_TANK              1       // temperature in tank
+#define ADC_T_FRIDGE            2       // temp of dstPut for stage 1, temp of out water for stage 2
+#define ADC_POT                 4       // potentiometr
 
 // IO pins
-#define ENC_A_PIN       34      // encoder CLK
-#define ENC_B_PIN       35      // encoder CSW
-#define ENC_BTN_PIN     32      // encoder button
-#define ALC_VALVE_REL   33      // alcohol valve relay pin
-#define BUZZER_PIN      25      // buzzer
-//#define COLD_VALVE_REL 31      // cold water valve relay pin
+#define ENC_A_PIN               34      // encoder CLK
+#define ENC_B_PIN               35      // encoder CSW
+#define ENC_BTN_PIN             32      // encoder button
+#define ALC_VALVE_REL           33      // alcohol valve relay pin
+#define BUZZER_PIN              25      // buzzer
+//#define COLD_VALVE_REL        31      // cold water valve relay pin
 
 // Refresh intervals
-#define RI_LCD          100     // LCD 
-#define RI_ADC          50      // MCP reading interval
-#define RI_ENC          500     // encoder process interval
+#define RI_LCD                  100     // LCD 
+#define RI_ADC                  50      // MCP reading interval
+#define RI_ENC                  500     // encoder process interval
+#define RI_PROG                 100     // current operation mode loop interval
 
-const char* ssid = "FRANTSOVA";
-const char* password = "218506oleg";
+const uint8_t COLUMN_HOT_TEMP = 45;     // temp to consider column as hot
+const uint8_t TANK_WARM_TEMP =  55;     // temp to consider tank as warm
 
 struct {
     float tank, column, fridge;
@@ -45,7 +44,7 @@ struct {
 
 uint16_t dstU;                  // voltage set point
 uint16_t dstP;                  // real dstPut power
-float dstPercent;               
+float dst_percent;               
 float heater_R = 16.13;         // heater resistance in Ohms 
 uint16_t pot;                   // potentiometr raw value
 uint32_t last_pot_ms;
@@ -61,7 +60,7 @@ enum OperationMode{
 
 enum DisplayContext{
     CONT_MAIN, 
-    CONT_SETTINGS
+    CONT_MENU
 } display_context;
 
 LiquidCrystal_I2C lcd(0x27,16,2);
@@ -72,6 +71,25 @@ RMVK rm;
 Relay alc_valve(ALC_VALVE_REL);
 Button2 enc_btn;
 
+// menu
+// Menu menu;
+// enum DistMenuItems{
+//     MI_ROOT,
+//         MI_SETT_,
+//             MI_SETT_HR,
+//             MI_SETT_MAXP,
+//         MI_JOB_,
+//             MI_JOB_MODE,
+//             MI_JOB_ENDT1
+// };
+
+// const char CAPT_MI_SETT_[] PROGMEM = "settings";
+// const char      CAPT_MI_SETT_HR[] PROGMEM = "heater R:";
+// const char      CAPT_MI_SETT_MAXP[] PROGMEM = "max output P:";
+// const char CAPT_MI_JOB_[] PROGMEM = "job";
+// const char      CAPT_MI_JOB_MODE[] PROGMEM = "mode:";
+// const char      CAPT_MI_JOB_ENDT1[] PROGMEM = "end temp:";
+
 
 void lcd_print_operation_vals(){
     // 1234567890123456
@@ -81,16 +99,28 @@ void lcd_print_operation_vals(){
     if ((millis() - ms) < RI_LCD)
         return;
 
+    // first line
+    lcd.setCursor(0, 0);
     char row[20];
-    sprintf(row, "%4s %4s %2s %1d %s", 
-        String(temp.tank, 1).c_str(), String(temp.column, 1).c_str(), 
-        String(temp.fridge, 0).c_str(), operation_mode, (alc_valve.getState()==RL_OFF) ? "x":"o"
+    char str_temp_tank[] = "00.0";
+    char str_temp_column[] = "00.0";
+    char str_temp_fridge[] = "00.0";
+    dtostrf(temp.tank, 4, 1, str_temp_tank);
+    dtostrf(temp.column, 4, 1, str_temp_column);
+    dtostrf(temp.fridge, 2, 0, str_temp_fridge);
+    char om_symb[] = "M012  ";
+    sprintf(row, "%4s %4s %2s %c %c", 
+        str_temp_tank, str_temp_column, str_temp_fridge, 
+        om_symb[operation_mode], (alc_valve.getState()==RL_OFF) ? 'x':'o'
     );
-    lcd.setCursor(0,0);
     lcd.print(row);
-    sprintf(row, "%3dV %4dW %s%s  ", rm.getVi(), rm.getP(), String(dstPercent, 0).c_str(),
-        (dstPercent - (int)dstPercent > 0.4) ? ".":" "); // put point to indicate decimals > 0.5
+
+    // second line
     lcd.setCursor(0,1);
+    char str_dst_percent[] = "000";
+    dtostrf(dst_percent, 3, 0, str_dst_percent);
+    sprintf(row, "%3dV %4dW %s%% ", 
+        rm.getVi(), rm.getP(), str_dst_percent);
     lcd.print(row);
 
     ms = millis();
@@ -108,14 +138,7 @@ void adc_read(){
     if (dstU < RM_MIN_V)
         dstU = 0;
     dstP = f_P(dstU, heater_R);
-    dstPercent = map(dstP, 0, rm.getMaxP(), 0, 1000)/10.0;
-
-    //debug
-    // if(dstU % 2 == 0)
-    //     alc_valve.on();
-    // else
-    //     alc_valve.off();
-
+    dst_percent = map(dstP, 0, rm.getMaxP(), 0, 1000)/10.0;
     
     static FilterExpRunningAverage filter_column, filter_tank, filter_fridge;
     temp.column = filter_column.filter(ntc_getC(adc.readADC(ADC_T_COLUMN)));
@@ -125,108 +148,152 @@ void adc_read(){
     ms = millis();
 }
 
-
-#ifdef WITH_OTA
-void initWiFI(){
-    // WiFi & OTA
-    lcd.clear();
-    lcd.print("Init WiFi...");
-    WiFi.mode(WIFI_STA);
-    WiFi.begin(ssid, password);
-    if (WiFi.waitForConnectResult() != WL_CONNECTED) {
-        lcd.clear();
-        lcd.print("WiFi init failed");
-        lcd.setCursor(0,1);
-        lcd.print("Skip using WiFi");
-        delay(2000);
-    } else {
-        lcd.clear();
-        lcd.print("WiFi connected");
-        lcd.setCursor(0,1);
-        lcd.print("IP: ");
-        lcd.print(WiFi.localIP());
-        delay(2000);
-
-        ArduinoOTA
-            .onStart([]() {
-                String type;
-                if (ArduinoOTA.getCommand() == U_FLASH)
-                    type = "sketch";
-                else // U_SPIFFS
-                    type = "filesystem";
-
-                // NOTE: if updating SPIFFS this would be the place to unmount SPIFFS using SPIFFS.end()
-                Serial.println("Start updating " + type);
-            })
-            .onEnd([]() {
-                Serial.println("\nEnd");
-            })
-            .onProgress([](unsigned int progress, unsigned int total) {
-                Serial.printf("Progress: %u%%\r", (progress / (total / 100)));
-            })
-            .onError([](ota_error_t error) {
-                Serial.printf("Error[%u]: ", error);
-                if (error == OTA_AUTH_ERROR) Serial.println("Auth Failed");
-                else if (error == OTA_BEGIN_ERROR) Serial.println("Begin Failed");
-                else if (error == OTA_CONNECT_ERROR) Serial.println("Connect Failed");
-                else if (error == OTA_RECEIVE_ERROR) Serial.println("Receive Failed");
-                else if (error == OTA_END_ERROR) Serial.println("End Failed");
-            });
-
-        ArduinoOTA.begin();
-        lcd.clear();
-        lcd.print("OTA ready");
-        delay(1000);
-        lcd.clear();
-    }
+void switch_operation_mode(OperationMode new_mode=SWITCH_NEXT){
+    if (new_mode == SWITCH_NEXT){
+        switch (operation_mode){
+        case MODE_OFF:
+            operation_mode = MODE_MANUAL;
+            break;
+        case MODE_MANUAL:
+            operation_mode = MODE_A0;
+            break;
+        case MODE_A0:
+            operation_mode = MODE_A1;
+            break;
+        case MODE_A1:
+            operation_mode = MODE_A2;
+            break;
+        case MODE_A2:
+            operation_mode = MODE_OFF;
+            break;
+        default:
+            break;
+        }    
+    } else
+        operation_mode = new_mode;
 }
-#endif
 
-void enc_loop(){
+
+void btn_click(Button2& btn){
+    // menu.enter();
+    switch_operation_mode();
+    buzzer.beep(1);
+}
+
+void btn_long_click(Button2& btn){
+    // menu.exit();
+    buzzer.beep(2);
+}
+
+void btn_dbl_click(Button2& btn){
+    alc_valve.togle();
+    buzzer.beep(3);
+}
+
+
+bool is_fridge_ok(){
+    const uint8_t THR_WARM = 30;
+    const uint8_t THR_HOT = 50;
+
+    if(temp.fridge > THR_WARM){
+    // if(temp.column >= COLUMN_HOT_TEMP && temp.fridge > THR_WARM){
+        buzzer.beep(1);
+        // float prcnt = (100 - map(temp.fridge, THR_WARM, THR_HOT, 1, 100)) / 100.0;
+        uint16_t safeU = proportial(dstU, temp.fridge, THR_WARM, THR_HOT);
+        rm.setVo(safeU);
+        return false;
+    }
+    return true;
+}
+
+void program_manual(){
+    rm.setVo(dstU);
+}
+
+// mode A0 routine - quick warm up
+void program_A0(){
     static uint32_t ms;
-    if (millis() - ms < 1000)
+    if(millis() - ms < RI_PROG)
         return;
-    
-    static int cnt;
-    if(cnt != encoder.getCount()){
-        alc_valve.togle();
-        cnt = encoder.getCount();
+
+    if (temp.column > COLUMN_HOT_TEMP){
+        uint16_t safeU = proportial(dstU, temp.column, COLUMN_HOT_TEMP - 5, COLUMN_HOT_TEMP + 5);
+        rm.setVo(safeU);
+        buzzer.beep(1);
+        return;
+    }
+
+    if(temp.tank < TANK_WARM_TEMP){
+        static float slowV =0;
+        if(slowV == 0)
+            slowV = RM_MIN_V;
+        if(slowV < dstU){
+            slowV += 0.3;       // increase output voltage 3 volts per second
+            rm.setVo(slowV);
+        } else
+            rm.setVo(dstU);
+    } else {
+        rm.setVo(dstU);
     }
     ms = millis();
 }
 
+// mode A1 routine
+void program_A1(){
+    static uint32_t ms;
+    if(millis() - ms < RI_PROG)
+        return;
 
-// human inputs processor (buttons, encoders, etc)
-void process_hum_inputs(){
-    // enc_btn.loop();
-    // if (enc_btn.longclick_detected_reported())
+    if(!is_fridge_ok())
+        return;
 
-    // switch (display_context){
-    // case CONT_MAIN:
-    //     break;
-    // case CONT_SETTINGS:
-    // default:
-    //     break;
-    // }
+    rm.setVo(dstU);
+    ms = millis();
 }
 
+// mode A2 routine
+void program_A2(){
+    static uint32_t ms;
+    if(millis() - ms < RI_PROG)
+        return;
+
+    if(!is_fridge_ok())
+        return;
+
+    rm.setVo(dstU);
+    ms = millis();
+}
 
 void loop(){
-    #ifdef WITH_OTA
+    #ifdef WITH_NETWORK
     ArduinoOTA.handle();
     #endif
 
+    adc_read();
+    enc_btn.loop();
+
+    switch (operation_mode){
+        case MODE_OFF:
+            rm.setVo(0);
+            break;
+        case MODE_MANUAL:
+            program_manual();
+            break;
+        case MODE_A0:
+            program_A0();
+            break;
+        case MODE_A1:
+            program_A1();
+            break;
+        case MODE_A2:
+            program_A2();
+            break;
+        default:
+            break;
+    }
     rm.loop();
     lcd_print_operation_vals();
-    adc_read();
-    process_hum_inputs();
-
-    if (millis() - last_pot_ms > 2000){
-        rm.setVo(dstU);
-    }
-
     buzzer.beep();
-    // btn_loop();
 }
 
 
@@ -250,18 +317,16 @@ void setup(){
     ESP32Encoder::useInternalWeakPullResistors=NONE;
 
     enc_btn.begin(ENC_BTN_PIN);
+    enc_btn.setLongClickTime(500);
+    enc_btn.setClickHandler(btn_click);
+    enc_btn.setLongClickHandler(btn_long_click);
+    enc_btn.setDoubleClickHandler(btn_dbl_click);
 
     rm.begin(heater_R);
-    
-    // for (int n=0;n<5;n++){
-    //     alc_valve.on();
-    //     delay(100);
-    //     alc_valve.off();
-    //     delay(100);
-    // }
 
-    #ifdef WITH_OTA
+    #ifdef WITH_NETWORK
     initWiFI();
+
     #endif
 
     buzzer.beep(3);

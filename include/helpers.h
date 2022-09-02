@@ -1,3 +1,5 @@
+#pragma once
+
 #ifndef helpers_h
 #define helpers_h
 
@@ -24,39 +26,6 @@ public:
 };
 
 
-enum RelayState {RL_OFF=0, RL_ON=1};
-
-class Relay {
-private:
-    uint8_t _pin;
-    RelayState _state;
-public:
-    Relay(uint8_t pin, RelayState init_state=RL_OFF){
-        _pin = pin;
-        pinMode(_pin, OUTPUT);
-        digitalWrite(_pin, init_state);
-        _state = init_state;
-    }
-    ~Relay(){};
-    RelayState getState(){
-        return _state;
-    }
-    void on(){
-        digitalWrite(_pin, RL_ON);
-        _state = RL_ON;
-    }
-    void off(){
-        digitalWrite(_pin, RL_OFF);
-        _state = RL_OFF;
-    }
-    void togle(){
-        _state = _state==RL_ON?RL_OFF:RL_ON;
-        digitalWrite(_pin, (bool)_state);
-    }
-
-};
-
-
 float ntc_getC(uint16_t adc_raw, uint32_t r_div=10000, 
                uint16_t betta=3950, uint16_t r_nom=10000, uint16_t t_nom=25, float max_t=99.9){
     float ntc_r = (r_div / (1023.0 / adc_raw - 1 ));
@@ -64,6 +33,11 @@ float ntc_getC(uint16_t adc_raw, uint32_t r_div=10000,
     if (t > max_t)
         t = max_t;
     return t;
+}
+
+uint16_t proportial(uint16_t input_val, uint16_t reg_val, uint16_t reg_val_low, uint16_t reg_val_high){
+    float prcnt = (100 - map(reg_val, reg_val_low, reg_val_high, 1, 100)) / 100.0; 
+    return input_val * prcnt;
 }
 
 #endif
